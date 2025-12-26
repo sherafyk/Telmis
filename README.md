@@ -1,59 +1,71 @@
 # Media Server (Docker Compose)
 
-This repo is the **source of truth** for a lightweight home media stack designed for:
-- **Local-only** access on your home Wi-Fi (no remote access / reverse proxy by default)
-- **Seamless reuse of existing media files** on an external drive (no re-download)
-- **Stability** by avoiding “VPN routes the whole machine”
-- **Low-end hardware** friendly defaults
+Local-only home media stack built for low-end hardware. This repo provides Emby plus automation (Sonarr/Radarr), Prowlarr, and qBittorrent routed **only** through VPN via Gluetun.
 
-## What’s in the stack
+## What’s included
 
 Core services:
-- **Emby** (media server)
-- **Sonarr** (TV automation)
-- **Radarr** (movie automation)
-- **Prowlarr** (indexer manager; syncs indexers to Sonarr/Radarr)
-- **Gluetun** (VPN tunnel container)
-- **qBittorrent** (torrent client) — runs **behind Gluetun only**
+- Emby
+- Sonarr
+- Radarr
+- Prowlarr
+- Gluetun (VPN tunnel)
+- qBittorrent (VPN-scoped)
 
 Optional services (profiles):
-- **Flaresolverr** (`--profile flaresolverr`) — only if you need it for tough indexers
-- **Jackett** (`--profile jackett`) — legacy compatibility (generally not needed if using Prowlarr)
+- Flaresolverr (`--profile flaresolverr`)
+- Jackett (`--profile jackett`) — legacy only
 
-## Networking model (important)
+**Local-only design:** no reverse proxy, TLS automation, or remote access components are included.
 
-Only **qBittorrent** is VPN-scoped.
+## Storage contract (single data root)
 
-In Compose, qBittorrent uses:
-- `network_mode: "service:gluetun"`
-
-So all torrent traffic is forced through the VPN tunnel, while Emby/Sonarr/Radarr/Prowlarr stay on normal LAN routing.
-
-## Storage model (simple + “no duplicates” friendly)
-
-This repo assumes your host has a single data root (recommended):
-- `DATA_DIR=/data`
-
-Inside it, use this layout:
+Set `DATA_DIR` in `.env` to the root of your media drive. It must contain:
 
 - `/data/media/movies`
 - `/data/media/tv`
 - `/data/torrents/incomplete`
 - `/data/torrents/complete`
 
-### Why mount everything under `/data`?
-Because Sonarr/Radarr can do clean “move” operations within one filesystem and avoid copy+delete behavior. It also keeps paths consistent across containers.
+All containers reference `/data` internally so that Sonarr/Radarr can move files without duplicate copies.
 
-## Ports (defaults)
+## Quick start (repo usage)
 
-- Emby: `8096`
-- Sonarr: `8989`
-- Radarr: `7878`
-- Prowlarr: `9696`
-- qBittorrent WebUI: `8080`
-- qBittorrent incoming: `6881/tcp` + `6881/udp`
+1) Copy the environment template:
 
-You can change these in `.env`.
+```bash
+cp .env.example .env
+```
 
-## Repo layout
+2) Edit `.env` and set your paths, ports, and VPN credentials.
 
+3) Start the stack:
+
+```bash
+docker compose up -d
+```
+
+4) Print local URLs:
+
+```bash
+./scripts/print-urls.sh
+```
+
+## App configuration notes
+
+### qBittorrent
+Set paths so downloads land in the shared `/data` tree:
+- Temporary/incomplete: `/data/torrents/incomplete`
+- Completed: `/data/torrents/complete`
+
+### Sonarr + Radarr
+Set root folders so they import into the shared media library:
+- Sonarr root folder: `/data/media/tv`
+- Radarr root folder: `/data/media/movies`
+
+When adding qBittorrent as a download client, use:
+- Host: `gluetun`
+- Port: `${QBITTORRENT_WEBUI_PORT}`
+
+### Existing library imports
+Emby points at `/data/media/...` and will index existing content immediately. Sonarr/Radarr can import existing libraries and optionally rename files over time.
