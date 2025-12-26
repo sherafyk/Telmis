@@ -1,345 +1,387 @@
-# Media Server Migration (Windows → Ubuntu Server + Docker) — Agent Runbook
+# AGENTS.md — Build the Repo “Docker Package” (End-to-End Spec)
 
-This repo is the “source of truth” for standing up a stable home media server:
+You are the coding agent working inside this GitHub repo. Your job is to **implement a complete, production-usable Docker Compose package** for a low-end home media server that:
 
-- Ubuntu Server LTS (headless)
-- Docker Compose stack:
-  - Emby (LAN)
-  - Sonarr (LAN)
-  - Radarr (LAN)
-  - Jackett (LAN)
-  - Gluetun (VPN tunnel)
-  - qBittorrent (runs *inside* Gluetun network namespace; VPN-only downloads)
+- **Reuses existing media files** on an external drive without re-downloading (Emby should index them immediately once the drive is mounted).
+- Continues automated downloads via Sonarr/Radarr → qBittorrent.
+- **Scopes VPN to torrents only** (no system-wide VPN routing).
+- Uses **Emby** (keep it), plus **Sonarr + Radarr**, and replaces Jackett with **Prowlarr** (preferred).
+- Targets **local-only** usage on home Wi-Fi (no remote access components).
+- Is optimized for a **low-end mini-PC** (assume weak CPU, 4GB RAM, no GPU).
+- Minimizes ongoing manual work and avoids duplicate file copies (best-practice import paths + single data root).
 
-## Non-negotiable invariants
+This document is the single source of truth for what must be built in the repo.
 
-### 1) Clean Linux paths regardless of Windows folder names
-The *canonical* paths used by containers MUST be:
+---
 
-- `/data/downloads`
+## 0) Scope and Non-Scope
+
+### IN SCOPE (what you must implement in this repo)
+- `compose.yaml` for the full stack
+- `.env.example` (template) + `.gitignore`
+- placeholder config directory structure tracked by git
+- minimal scripts for validation + ergonomics
+- optional `Makefile` targets
+- README updates (repo usage + app-level configuration notes; no OS steps)
+- optional CI workflow for lint/validation (no secrets, no external dependencies required)
+
+### OUT OF SCOPE (do NOT write these instructions into this repo)
+- Windows backup procedures
+- Ubuntu installation instructions
+- drive formatting/mounting/fstab/systemd units
+- router configuration, reverse proxy, TLS, remote access
+- “how to torrent” guidance or indexer sourcing
+The user will handle machine setup separately. This repo is the “package” they deploy.
+
+---
+
+## 1) Architecture Decisions (Locked)
+
+### 1.1 Service set (core)
+Must include these containers:
+- `emby`
+- `sonarr`
+- `radarr`
+- `prowlarr`
+- `gluetun`
+- `qbittorrent`
+
+Optional services (must be implemented as **Compose profiles** so they’re off by default):
+- `flaresolverr` (profile: `flaresolverr`)
+- `jackett` (profile: `jackett`) — legacy only
+
+### 1.2 Networking (critical)
+- **Only qBittorrent is behind VPN.**
+- Implement VPN scoping via:
+  - `qbittorrent.network_mode: "service:gluetun"`
+- Expose qBittorrent ports on **gluetun**, not on qbittorrent.
+- All other services remain on a normal bridge network (e.g., `media`).
+
+**Connectivity rule for Sonarr/Radarr → qB:**
+- Since qbittorrent shares gluetun’s network namespace, other containers should talk to qB via:
+  - Host: `gluetun`
+  - Port: `${QBITTORRENT_WEBUI_PORT}` (default 8080)
+This avoids relying on host IP or special Docker hostname hacks.
+
+### 1.3 Storage and path contract (critical)
+User wants “seamless” reuse of existing media (no re-download) and minimal manual work.
+
+This repo must standardize a **single canonical container path**: `/data`.
+
+All data paths inside containers MUST be under `/data`:
+
+**Required canonical layout (Option 2, locked):**
 - `/data/media/movies`
 - `/data/media/tv`
+- `/data/torrents/incomplete`
+- `/data/torrents/complete`
 
-Even if the physical disk still contains:
-- `EMBY Media/Movies`
-- `EMBY Media/TV Shows`
-- `Downloads - qB`
+**Hard requirement:**
+- In `compose.yaml`, mount `${DATA_DIR}:/data` into Sonarr, Radarr, and qBittorrent.
+  - This ensures all apps see consistent paths and allows best-practice moves within a single filesystem.
 
-We achieve this using:
-- Physical disk mounted by UUID at `/mnt/storage`
-- Bind mounts from `/mnt/storage/...` → `/data/...`
+**Existing library compatibility:**
+- Emby must mount:
+  - `${DATA_DIR}/media/movies` and `${DATA_DIR}/media/tv`
+- Emby should be mounted **read-only** by default to protect media files.
 
-### 2) VPN isolation
-Only qBittorrent is behind VPN:
-- `qbittorrent` uses `network_mode: "service:gluetun"`
-- qBittorrent ports are exposed on `gluetun` (not on qbittorrent)
+### 1.4 Filesystem assumption
+User chose the “best” route: external drive will be **ext4** (single Linux-native filesystem).  
+Do not add formatting instructions; simply design the repo to work optimally given ext4 and consistent mounting.
 
-### 3) “No /data mount = no start”
-On boot, the stack MUST NOT start unless `/data` is mounted.
+### 1.5 Keep Emby, LAN-only
+- No reverse proxy, no HTTPS automation, no remote features.
+- Expose Emby’s HTTP port only by default.
 
----
-
-# Phase A — Windows “source” backup (do this BEFORE wiping)
-
-1) Stop these apps/services:
-- Emby Server
-- Sonarr
-- Radarr
-- Jackett
-- qBittorrent
-
-2) Backup the *entire* folders (zip whole folders, no cherry-picking):
-
-- `C:\ProgramData\Radarr\`
-- `C:\ProgramData\Sonarr\`
-- `C:\ProgramData\Jackett\`
-- `C:\Users\TELMIS\AppData\Roaming\qBittorrent\`
-- `C:\Users\TELMIS\AppData\Roaming\Emby-Server\`
-
-3) Put the backup zips somewhere safe (USB stick or another machine).
-
-Optional extra: Download in-app backups
-- Sonarr → System → Backup
-- Radarr → System → Backup
-
-If you want automation, run: `scripts/windows-backup.ps1` as Admin.
+### 1.6 Preserve existing app settings (best effort)
+User *prefers* to preserve current Sonarr/Radarr/qB settings, but it’s not strict.  
+Repo must:
+- Use bind-mounted config directories that make it easy to drop-in existing configs
+- Avoid opinionated resets or “fresh init” scripts
+- Avoid writing anything into `/config` at build time
 
 ---
 
-# Phase B — Ubuntu install (target)
+## 2) Repo Deliverables (Files You Must Create/Update)
 
-Install Ubuntu Server LTS.
+### 2.1 Required files
+1) `compose.yaml`  
+2) `.env.example`  
+3) `.gitignore`  
+4) `config/.gitkeep`  
+5) `README.md` (repo usage + app-level notes; no OS steps)  
+6) `scripts/validate.sh`  
+7) `scripts/print-urls.sh`
 
-During install:
-- enable OpenSSH server
-- set timezone to America/Los_Angeles
-- create a normal user (this will usually become UID/GID 1000)
-
-After install:
-- `sudo apt update && sudo apt upgrade -y`
-
----
-
-# Phase C — One-time server bootstrap (Ubuntu)
-
-## C1) Install Docker Engine + Compose plugin
-Run:
-- `scripts/bootstrap-ubuntu.sh`
-
-It installs:
-- docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin
-- git, curl, ca-certificates
-
-## C2) Mount the external data drive
-Run:
-- `scripts/mount-data.sh`
-
-This script:
-- shows you the disk UUID via `lsblk -f` / `blkid`
-- mounts the disk at `/mnt/storage` by UUID (fstab)
-- creates bind mounts to produce canonical `/data/...` paths (fstab)
-- verifies `/data/downloads` and `/data/media/*` exist and are writable
-
-## C3) Clone and configure repo
-Recommended location:
-- `/opt/media-server`
-
-Commands:
-- `sudo mkdir -p /opt/media-server && sudo chown -R $USER:$USER /opt/media-server`
-- `git clone <YOUR_REPO_URL> /opt/media-server`
-- `cd /opt/media-server`
-- `cp .env.example .env`
-- edit `.env` and set the NordVPN/Gluetun variables + LAN subnet
-
-## C4) Restore Windows configs into Docker volume folders
-Copy the backed up Windows folders into:
-
-- `/opt/media-server/config/radarr`
-- `/opt/media-server/config/sonarr`
-- `/opt/media-server/config/jackett`
-- `/opt/media-server/config/qbittorrent`
-- `/opt/media-server/config/emby`
-
-Use:
-- `scripts/restore-configs.sh /path/to/your/windows-backups`
-
-## C5) Install systemd unit to enforce “no /data = no start”
-Run:
-- `sudo cp systemd/media-server.service /etc/systemd/system/media-server.service`
-- `sudo systemctl daemon-reload`
-- `sudo systemctl enable --now media-server.service`
+### 2.2 Recommended files
+8) `Makefile` (quality-of-life commands)  
+9) `.github/workflows/ci.yml` (validate compose + shellcheck scripts)
 
 ---
 
-# Phase D — Bring up stack and verify
+## 3) compose.yaml — Implementation Requirements
 
-Bring up:
-- `make up`
+### 3.1 Images (use these defaults)
+Use widely adopted images:
+- Emby: `lscr.io/linuxserver/emby:latest`
+- Sonarr: `lscr.io/linuxserver/sonarr:latest`
+- Radarr: `lscr.io/linuxserver/radarr:latest`
+- Prowlarr: `lscr.io/linuxserver/prowlarr:latest`
+- qBittorrent: `lscr.io/linuxserver/qbittorrent:latest`
+- Gluetun: `qmcgaw/gluetun:latest`
+- Flaresolverr: `ghcr.io/flaresolverr/flaresolverr:latest`
+- Jackett: `lscr.io/linuxserver/jackett:latest`
 
-Verify:
-- `make ps`
-- `make logs-gluetun`
-- `make logs-qb`
+### 3.2 Container names (must match exactly)
+- `emby`, `sonarr`, `radarr`, `prowlarr`, `gluetun`, `qbittorrent`
+- Optional: `flaresolverr`, `jackett`
 
-Then run:
-- `scripts/verify.sh`
+### 3.3 Restart policy
+All services:
+- `restart: unless-stopped`
 
-Expected UIs:
-- Emby: `http://<server-ip>:8096`
-- Sonarr: `http://<server-ip>:8989`
-- Radarr: `http://<server-ip>:7878`
-- Jackett: `http://<server-ip>:9117`
-- qBittorrent (through Gluetun): `http://<server-ip>:8080`
+### 3.4 Environment conventions
+LinuxServer containers must include:
+- `PUID`, `PGID`, `TZ`, `UMASK` (UMASK optional but recommended)
 
----
+### 3.5 Volumes (must be bind mounts; consistent and predictable)
+- Config volumes must be:
+  - `${CONFIG_DIR}/emby:/config`
+  - `${CONFIG_DIR}/sonarr:/config`
+  - `${CONFIG_DIR}/radarr:/config`
+  - `${CONFIG_DIR}/prowlarr:/config`
+  - `${CONFIG_DIR}/qbittorrent:/config`
+  - `${CONFIG_DIR}/gluetun:/gluetun`
+  - optional: `${CONFIG_DIR}/jackett:/config`
 
-# Phase E — Post-restore in-app adjustments (likely required)
+- Data volumes:
+  - Sonarr: `${DATA_DIR}:/data`
+  - Radarr: `${DATA_DIR}:/data`
+  - qBittorrent: `${DATA_DIR}:/data`
+  - Emby:
+    - `${DATA_DIR}/media/movies:/data/movies:ro`
+    - `${DATA_DIR}/media/tv:/data/tv:ro`
 
-## Sonarr / Radarr paths
-Update root folders to:
-- Movies: `/data/media/movies`
-- TV: `/data/media/tv`
+### 3.6 Ports (defaults configurable via .env)
+Publish host ports as:
+- Emby: `${EMBY_HTTP_PORT}:8096`
+- Sonarr: `${SONARR_PORT}:8989`
+- Radarr: `${RADARR_PORT}:7878`
+- Prowlarr: `${PROWLARR_PORT}:9696`
 
-Update download path assumptions to:
-- `/data/downloads`
+qBittorrent ports must be published **on gluetun**:
+- `${QBITTORRENT_WEBUI_PORT}:${QBITTORRENT_WEBUI_PORT}`
+- `${QBITTORRENT_PORT}:${QBITTORRENT_PORT}/tcp`
+- `${QBITTORRENT_PORT}:${QBITTORRENT_PORT}/udp`
 
-## Sonarr/Radarr → qBittorrent connectivity
-qBittorrent is behind Gluetun, so other containers should talk to it via the HOST port.
-We include `extra_hosts: host.docker.internal:host-gateway` so containers can use:
+Do NOT publish qB ports directly on qbittorrent service.
 
-- Host: `host.docker.internal`
-- Port: `${QBIT_WEBUI_PORT}`
+### 3.7 Gluetun VPN env (NordVPN)
+Support BOTH OpenVPN and WireGuard (user can pick later) via `.env`:
 
----
+In `gluetun.environment` include:
+- `VPN_SERVICE_PROVIDER=nordvpn`
+- `VPN_TYPE=${VPN_TYPE}` where VPN_TYPE is `openvpn` or `wireguard`
 
-# File templates the agent must generate
+OpenVPN vars:
+- `OPENVPN_USER=${NORDVPN_USER}`
+- `OPENVPN_PASSWORD=${NORDVPN_PASSWORD}`
 
-## 1) .env.example
-Create `.env.example` with:
-
-- TZ=America/Los_Angeles
-- PUID=1000
-- PGID=1000
-- CONFIG_DIR=/opt/media-server/config
-- DATA_DIR=/data
-- LAN_SUBNET=192.168.1.0/24
-
-- QBIT_WEBUI_PORT=8080
-- QBIT_TORRENT_PORT=6881
-
-### Gluetun / NordVPN (choose ONE protocol)
-OpenVPN:
-- VPN_SERVICE_PROVIDER=nordvpn
-- VPN_TYPE=openvpn
-- OPENVPN_USER=...
-- OPENVPN_PASSWORD=...
-
-WireGuard:
-- VPN_SERVICE_PROVIDER=nordvpn
-- VPN_TYPE=wireguard
-- WIREGUARD_PRIVATE_KEY=...
-- WIREGUARD_ADDRESSES=...
+WireGuard vars:
+- `WIREGUARD_PRIVATE_KEY=${NORDVPN_WIREGUARD_PRIVATE_KEY}`
+- `WIREGUARD_ADDRESSES=${NORDVPN_WIREGUARD_ADDRESSES}`
 
 Optional server filters:
-- SERVER_COUNTRIES=United States
-- SERVER_CITIES=Los Angeles
+- `SERVER_COUNTRIES=${VPN_SERVER_COUNTRIES}` (default “United States”)
 
-## 2) compose.yaml
-Create `compose.yaml` exactly as below.
+Firewall allowlist:
+- `FIREWALL_INPUT_PORTS=${QBITTORRENT_WEBUI_PORT},${QBITTORRENT_PORT}`
 
-## 3) systemd/media-server.service
-Create a systemd unit that requires `/data` to be mounted before running compose.
+Do not overcomplicate DNS or outbound subnet rules by default. Leave commented knobs in `.env.example`.
 
-## 4) scripts/*
-Generate the scripts below. They must be idempotent (safe to re-run).
+### 3.8 Low-end optimization requirements
+Add conservative defaults that help small machines:
+- Add log rotation limits for chatty containers (compose `logging` driver options):
+  - `max-size: "10m"`, `max-file: "3"` (for all services)
+- Avoid “nice to have” services (Portainer, Watchtower, dashboards) — not requested.
+- Keep Emby HTTPS port disabled by default (no 8920 mapping unless the user opts in).
+
+### 3.9 Optional profiles
+- `flaresolverr` must be behind `profiles: ["flaresolverr"]` and only on internal network.
+- `jackett` must be behind `profiles: ["jackett"]`.
 
 ---
 
-# compose.yaml
+## 4) .env.example — Implementation Requirements
 
-```yaml
-services:
-  emby:
-    image: lscr.io/linuxserver/emby:latest
-    container_name: emby
-    environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-    volumes:
-      - ${CONFIG_DIR}/emby:/config
-      - ${DATA_DIR}/media/movies:/data/movies
-      - ${DATA_DIR}/media/tv:/data/tv
-    ports:
-      - "8096:8096"
-      - "8920:8920"
-    restart: unless-stopped
+Must include:
+- Identity / perms:
+  - `TZ=America/Los_Angeles`
+  - `PUID=1000`
+  - `PGID=1000`
+  - `UMASK=022`
 
-  sonarr:
-    image: lscr.io/linuxserver/sonarr:latest
-    container_name: sonarr
-    environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-    volumes:
-      - ${CONFIG_DIR}/sonarr:/config
-      - ${DATA_DIR}/media/tv:/tv
-      - ${DATA_DIR}/downloads:/downloads
-    ports:
-      - "8989:8989"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
+- Host paths (ABSOLUTE recommended):
+  - `CONFIG_DIR=/opt/media-server/config`
+  - `DATA_DIR=/data`
 
-  radarr:
-    image: lscr.io/linuxserver/radarr:latest
-    container_name: radarr
-    environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-    volumes:
-      - ${CONFIG_DIR}/radarr:/config
-      - ${DATA_DIR}/media/movies:/movies
-      - ${DATA_DIR}/downloads:/downloads
-    ports:
-      - "7878:7878"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
+- Ports:
+  - `EMBY_HTTP_PORT=8096`
+  - `SONARR_PORT=8989`
+  - `RADARR_PORT=7878`
+  - `PROWLARR_PORT=9696`
+  - `QBITTORRENT_WEBUI_PORT=8080`
+  - `QBITTORRENT_PORT=6881`
+  - (optional) `JACKETT_PORT=9117`
 
-  jackett:
-    image: lscr.io/linuxserver/jackett:latest
-    container_name: jackett
-    environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-      - AUTO_UPDATE=true
-    volumes:
-      - ${CONFIG_DIR}/jackett:/config
-      - ${DATA_DIR}/downloads:/downloads
-    ports:
-      - "9117:9117"
-    restart: unless-stopped
+- Gluetun/Nord:
+  - `VPN_TYPE=openvpn` (default)
+  - `NORDVPN_USER=`
+  - `NORDVPN_PASSWORD=`
+  - `NORDVPN_WIREGUARD_PRIVATE_KEY=`
+  - `NORDVPN_WIREGUARD_ADDRESSES=`
+  - `VPN_SERVER_COUNTRIES=United States`
 
-  gluetun:
-    image: qmcgaw/gluetun:latest
-    container_name: gluetun
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    volumes:
-      - ${CONFIG_DIR}/gluetun:/gluetun
-    ports:
-      - "${QBIT_WEBUI_PORT}:${QBIT_WEBUI_PORT}"
-      - "${QBIT_TORRENT_PORT}:${QBIT_TORRENT_PORT}"
-      - "${QBIT_TORRENT_PORT}:${QBIT_TORRENT_PORT}/udp"
-    environment:
-      - TZ=${TZ}
+Include comments clarifying:
+- Nord uses “service credentials” (user supplies them)
+- WireGuard variables only apply when VPN_TYPE=wireguard
+- DATA_DIR must contain the canonical folder structure under `/data`
 
-      # VPN provider
-      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER}
-      - VPN_TYPE=${VPN_TYPE}
+Do NOT include any real secrets or example credentials.
 
-      # OpenVPN
-      - OPENVPN_USER=${OPENVPN_USER}
-      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD}
+---
 
-      # WireGuard
-      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
-      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES}
+## 5) .gitignore + config placeholder requirements
 
-      # Optional server filters
-      - SERVER_COUNTRIES=${SERVER_COUNTRIES}
-      - SERVER_CITIES=${SERVER_CITIES}
+### 5.1 .gitignore must ignore
+- `.env`
+- everything under `config/` except `.gitkeep`
+- `*.log` and other runtime junk
 
-      # Allow LAN to reach qB WebUI via gluetun container firewall
-      - FIREWALL_INPUT_PORTS=${QBIT_WEBUI_PORT}
+### 5.2 config directory
+- Must include `config/.gitkeep` so the directory exists in git.
+- Do not commit real configs.
 
-      # If your VPN/provider supports incoming port forwarding and you use it:
-      - FIREWALL_VPN_INPUT_PORTS=${QBIT_TORRENT_PORT}
+---
 
-      # Allow gluetun namespace containers to access LAN subnet if ever needed
-      - FIREWALL_OUTBOUND_SUBNETS=${LAN_SUBNET}
+## 6) Scripts (repo ergonomics)
 
-    restart: unless-stopped
+### 6.1 scripts/validate.sh (required)
+- Must run `docker compose config -q`
+- Must exit non-zero if invalid
+- Must be safe to run repeatedly
+- Use:
+  - `set -euo pipefail`
 
-  qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
-    container_name: qbittorrent
-    network_mode: "service:gluetun"
-    depends_on:
-      - gluetun
-    environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-      - WEBUI_PORT=${QBIT_WEBUI_PORT}
-      - TORRENTING_PORT=${QBIT_TORRENT_PORT}
-    volumes:
-      - ${CONFIG_DIR}/qbittorrent:/config
-      - ${DATA_DIR}/downloads:/downloads
-    restart: unless-stopped
+### 6.2 scripts/print-urls.sh (required)
+- Must print the LAN URLs for each UI using the ports from `.env`:
+  - Emby, Sonarr, Radarr, Prowlarr, qBittorrent
+- Must not assume a hostname; print `<server-ip>` placeholder unless `HOSTNAME_OVERRIDE` is set.
+
+---
+
+## 7) Makefile (recommended)
+
+Implement at least:
+- `make up`       → `docker compose up -d`
+- `make down`     → `docker compose down`
+- `make ps`       → `docker compose ps`
+- `make logs`     → `docker compose logs -f --tail=200`
+- `make pull`     → `docker compose pull`
+- `make restart`  → `docker compose restart`
+- `make config`   → `docker compose config`
+- `make validate` → `./scripts/validate.sh`
+
+No OS-specific assumptions; do not use GNU-only extensions beyond standard make conventions.
+
+---
+
+## 8) README.md — Must Be Updated (Repo Usage + App-Level Notes Only)
+
+README must include:
+1) What the stack is (Emby + Sonarr/Radarr + Prowlarr + qB behind VPN)
+2) Storage contract (DATA_DIR must contain):
+   - `/data/media/movies`
+   - `/data/media/tv`
+   - `/data/torrents/incomplete`
+   - `/data/torrents/complete`
+3) Minimal “repo usage” steps:
+   - copy `.env.example` → `.env`
+   - edit `.env`
+   - `docker compose up -d`
+   - `./scripts/print-urls.sh`
+4) App-level configuration notes (NOT OS steps):
+   - In qBittorrent set:
+     - temp/incomplete: `/data/torrents/incomplete`
+     - completed: `/data/torrents/complete`
+   - In Sonarr/Radarr set root folders:
+     - `/data/media/tv`
+     - `/data/media/movies`
+   - Explain that Sonarr/Radarr should connect to qB using:
+     - Host `gluetun`, Port `${QBITTORRENT_WEBUI_PORT}`
+   - Mention “existing library import” concept:
+     - Emby points at `/data/media/...` and indexes existing content
+     - Sonarr/Radarr can import existing content and optionally rename gradually
+
+Must explicitly state:
+- Local-only design
+- No remote access components included
+
+---
+
+## 9) Optional CI (recommended)
+
+Add `.github/workflows/ci.yml`:
+- Trigger on push + PR
+- Steps:
+  - checkout
+  - run `docker compose config -q` using `.env.example` copied to `.env` (with blank secrets allowed)
+  - run shellcheck on `scripts/*.sh` if available (or a lightweight bash lint equivalent)
+- CI must not require secrets.
+
+Important: Compose validation in CI should not actually start containers; only validate config renders.
+
+---
+
+## 10) Implementation Plan (What You Must Do in Order)
+
+1) Create/update `.gitignore`
+2) Create `config/.gitkeep`
+3) Create `.env.example` exactly per requirements
+4) Create `compose.yaml` meeting the locked architecture + constraints
+5) Create scripts:
+   - `scripts/validate.sh`
+   - `scripts/print-urls.sh`
+   Make them executable (`chmod +x`).
+6) Create `Makefile` (recommended)
+7) Update `README.md` to match this repo design
+8) (Optional) Add CI workflow
+9) Run local validation:
+   - `docker compose config -q`
+   - `./scripts/validate.sh`
+   - Ensure `docker compose up -d` would work with a real `.env` and mounted data dir (do not require actual VPN secrets at validation stage).
+
+---
+
+## 11) Definition of Done (Acceptance Checklist)
+
+Repo is complete when:
+- [ ] All required files exist (compose, env template, scripts, gitignore, config placeholder, README)
+- [ ] `docker compose config -q` succeeds with `.env.example` copied to `.env` (secrets blank but present)
+- [ ] qBittorrent is definitively VPN-scoped:
+  - [ ] qbittorrent has `network_mode: "service:gluetun"`
+  - [ ] qB ports published on gluetun only
+- [ ] All services bind-mount configs under `${CONFIG_DIR}/...`
+- [ ] Sonarr/Radarr/qB mount `${DATA_DIR}:/data` (single data root)
+- [ ] Emby mounts media folders read-only
+- [ ] Log rotation is configured to avoid disk bloat on a low-end machine
+- [ ] Optional services are behind profiles and do not run by default
+- [ ] No secrets are committed (`.env` ignored, config ignored)
+
+---
+
+## 12) Exact Content Templates (You may implement directly)
+
+You should implement the compose/env/scripts with the exact structure described above. Keep it clean, minimal, and consistent.
+
+Do not introduce additional complexity unless required by the constraints in this file.
